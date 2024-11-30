@@ -6,15 +6,15 @@ from glob import iglob
 
 import torch
 import torch._inductor.config as inductor_config
-from einops import rearrange
 from fire import Fire
-from PIL import Image
+from transformers import pipeline
 
 from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
-from flux.util import configs, embed_watermark, load_ae, load_clip, load_flow_model, load_t5
+from flux.util import configs, load_ae, load_clip, load_flow_model, load_t5, save_image, save_image_without_nsfw_check
 
-NSFW_THRESHOLD = 0.85
+CHECK_NSFW = False
 TORCH_COMPILE = os.getenv("TORCH_COMPILE", "0") == "1"
+
 
 @dataclass
 class SamplingOptions:
@@ -24,37 +24,6 @@ class SamplingOptions:
     num_steps: int
     guidance: float
     seed: int | None
-
-class CudaTimer:
-    """
-    A static context manager class for measuring execution time of PyTorch code
-    using CUDA events. It synchronizes GPU operations to ensure accurate time measurements.
-    """
-
-    def __init__(self, name="", precision=5, display=False):
-        self.name = name
-        self.precision = precision
-        self.display = display
-
-    def __enter__(self):
-        torch.cuda.synchronize()
-        self.start_event = torch.cuda.Event(enable_timing=True)
-        self.end_event = torch.cuda.Event(enable_timing=True)
-        self.start_event.record()
-        return self
-
-    def __exit__(self, *exc):
-        self.end_event.record()
-        torch.cuda.synchronize()
-        # Convert from ms to s
-        self.elapsed_time = self.start_event.elapsed_time(self.end_event) * 1e-3
-
-        if self.display:
-            print(f"{self.name}: {self.elapsed_time:.{self.precision}f} s")
-
-    def get_elapsed_time(self):
-        """Returns the elapsed time in microseconds."""
-        return self.elapsed_time
 
 
 def parse_prompt(options: SamplingOptions) -> SamplingOptions | None:
@@ -111,7 +80,7 @@ def parse_prompt(options: SamplingOptions) -> SamplingOptions | None:
                 continue
             _, steps = prompt.split()
             options.num_steps = int(steps)
-            print(f"Setting seed to {options.num_steps}")
+            print(f"Setting number of steps to {options.num_steps}")
         elif prompt.startswith("/q"):
             print("Quitting")
             return None
@@ -130,11 +99,17 @@ def main(
     width: int = 1360,
     height: int = 768,
     seed: int | None = None,
-    prompt: str = "A tree",
+    prompt: str = (
+        "a photo of a forest with mist swirling around the tree trunks. The word "
+        '"FLUX" is painted over it in big, red brush strokes with visible texture'
+    ),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
     num_steps: int | None = None,
     loop: bool = False,
     guidance: float = 3.5,
+    offload: bool = False,
     output_dir: str = "output",
+    add_sampling_metadata: bool = True,
 ):
     """
     Sample the flux model. Either interactively (set `--loop`) or run for a
@@ -154,12 +129,13 @@ def main(
         guidance: guidance value used for guidance distillation
         add_sampling_metadata: Add the prompt to the image Exif metadata
     """
-    device = torch.device("cuda")
+    nsfw_classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection", device=device)
 
     if name not in configs:
         available = ", ".join(configs.keys())
         raise ValueError(f"Got unknown model name: {name}, chose from {available}")
 
+    torch_device = torch.device(device)
     if num_steps is None:
         num_steps = 4 if name == "flux-schnell" else 50
 
@@ -179,10 +155,10 @@ def main(
             idx = 0
 
     # init all components
-    t5 = load_t5(device, max_length=256 if name == "flux-schnell" else 512)
-    clip = load_clip(device=device)
-    model = load_flow_model(name, device=device)
-    ae = load_ae(name, device=device)
+    t5 = load_t5(torch_device, max_length=256 if name == "flux-schnell" else 512)
+    clip = load_clip(torch_device)
+    model = load_flow_model(name, device="cpu" if offload else torch_device)
+    ae = load_ae(name, device="cpu" if offload else torch_device)
 
     if TORCH_COMPILE:
         # torch._inductor.list_options()
@@ -208,69 +184,67 @@ def main(
 
     if loop:
         opts = parse_prompt(opts)
-    # warmup
-    for _ in range(3):
+
+    while opts is not None:
         if opts.seed is None:
             opts.seed = rng.seed()
         print(f"Generating with seed {opts.seed}:\n{opts.prompt}")
+        t0 = time.perf_counter()
+
         # prepare input
         x = get_noise(
             1,
             opts.height,
             opts.width,
-            device=device,
+            device=torch_device,
             dtype=torch.bfloat16,
             seed=opts.seed,
         )
         opts.seed = None
-
+        if offload:
+            ae = ae.cpu()
+            torch.cuda.empty_cache()
+            t5, clip = t5.to(torch_device), clip.to(torch_device)
         inp = prepare(t5, clip, x, prompt=opts.prompt)
         timesteps = get_schedule(opts.num_steps, inp["img"].shape[1], shift=(name != "flux-schnell"))
+
+        # offload TEs to CPU, load model to gpu
+        if offload:
+            t5, clip = t5.cpu(), clip.cpu()
+            torch.cuda.empty_cache()
+            model = model.to(torch_device)
+
         # denoise initial noise
-        # with torch.no_grad():
-        #     with torch.profiler.profile(on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'), with_stack=True) as prof:
         x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+
+        # offload model, load autoencoder to gpu
+        if offload:
+            model.cpu()
+            torch.cuda.empty_cache()
+            ae.decoder.to(x.device)
+
         # decode latents to pixel space
         x = unpack(x.float(), opts.height, opts.width)
-
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
             x = ae.decode(x)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
 
         fn = output_name.format(idx=idx)
-        print(f"Saving {fn}")
-        # bring into PIL format and save
-        x = x.clamp(-1, 1)
-        x = embed_watermark(x.float())
-        x = rearrange(x[0], "c h w -> h w c")
+        print(f"Done in {t1 - t0:.1f}s. Saving {fn}")
 
-        img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
-        img.save(fn, exif=Image.Exif(), quality=95, subsampling=0)
-        idx += 1
+        if CHECK_NSFW:
+            idx = save_image(nsfw_classifier, name, output_name, idx, x, add_sampling_metadata, prompt)
+        else:
+            idx = save_image_without_nsfw_check(name, output_name, idx, x, add_sampling_metadata, prompt)
 
-    with CudaTimer(display=False) as timer:
-        if opts.seed is None:
-            opts.seed = rng.seed()
-        print(f"Generating with seed {opts.seed}:\n{opts.prompt}")
-        # prepare input
-        x = get_noise(
-            1,
-            opts.height,
-            opts.width,
-            device=device,
-            dtype=torch.bfloat16,
-            seed=opts.seed,
-        )
-        opts.seed = None
-        inp = prepare(t5, clip, x, prompt=opts.prompt)
-        timesteps = get_schedule(opts.num_steps, inp["img"].shape[1], shift=(name != "flux-schnell"))
-        # denoise initial noise
-        x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
-        # decode latents to pixel space
-        x = unpack(x.float(), opts.height, opts.width)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            x = ae.decode(x)
-
-    print(f"Inference time: {timer.get_elapsed_time()}")
+        if loop:
+            print("-" * 80)
+            opts = parse_prompt(opts)
+        else:
+            opts = None
 
 
 def app():

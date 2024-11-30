@@ -25,6 +25,7 @@ from flux.util import (
 )
 
 NSFW_THRESHOLD = 0.85
+CHECK_NSFW = False
 
 
 @st.cache_resource()
@@ -242,36 +243,36 @@ def main(
         img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
         nsfw_score = [x["score"] for x in nsfw_classifier(img) if x["label"] == "nsfw"][0]
 
-        # if nsfw_score < NSFW_THRESHOLD:
-        buffer = BytesIO()
-        exif_data = Image.Exif()
-        if init_image is None:
-            exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
+        if not CHECK_NSFW or nsfw_score < NSFW_THRESHOLD:
+            buffer = BytesIO()
+            exif_data = Image.Exif()
+            if init_image is None:
+                exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
+            else:
+                exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
+            exif_data[ExifTags.Base.Make] = "Black Forest Labs"
+            exif_data[ExifTags.Base.Model] = name
+            if add_sampling_metadata:
+                exif_data[ExifTags.Base.ImageDescription] = prompt
+            img.save(buffer, format="jpeg", exif=exif_data, quality=95, subsampling=0)
+
+            img_bytes = buffer.getvalue()
+            if save_samples:
+                print(f"Saving {fn}")
+                with open(fn, "wb") as file:
+                    file.write(img_bytes)
+                idx += 1
+
+            st.session_state["samples"] = {
+                "prompt": opts.prompt,
+                "img": img,
+                "seed": opts.seed,
+                "bytes": img_bytes,
+            }
+            opts.seed = None
         else:
-            exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
-        exif_data[ExifTags.Base.Make] = "Black Forest Labs"
-        exif_data[ExifTags.Base.Model] = name
-        if add_sampling_metadata:
-            exif_data[ExifTags.Base.ImageDescription] = prompt
-        img.save(buffer, format="jpeg", exif=exif_data, quality=95, subsampling=0)
-
-        img_bytes = buffer.getvalue()
-        if save_samples:
-            print(f"Saving {fn}")
-            with open(fn, "wb") as file:
-                file.write(img_bytes)
-            idx += 1
-
-        st.session_state["samples"] = {
-            "prompt": opts.prompt,
-            "img": img,
-            "seed": opts.seed,
-            "bytes": img_bytes,
-        }
-        opts.seed = None
-        # else:
-        #     st.warning("Your generated image may contain NSFW content.")
-        #     st.session_state["samples"] = None
+            st.warning("Your generated image may contain NSFW content.")
+            st.session_state["samples"] = None
 
     samples = st.session_state.get("samples", None)
     if samples is not None:
