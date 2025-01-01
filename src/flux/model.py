@@ -4,15 +4,14 @@ import torch
 from torch import Tensor, nn
 
 from flux.modules.layers import (
-    DoubleStreamBlock,
     EmbedND,
     LastLayer,
     MLPEmbedder,
-    SingleStreamBlock,
     timestep_embedding,
 )
 from flux.modules.lora import LinearLora, replace_linear_with_lora
 
+from triton_kernels import SingleStreamBlock, DoubleStreamBlock
 
 @dataclass
 class FluxParams:
